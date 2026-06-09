@@ -1,12 +1,135 @@
-# preparation----
-source("/Users/BigBear/Dropbox (UMass Medical School)/NutStore/Code/R/common.R")
-setwd("/Users/BigBear/Dropbox (UMass Medical School)/Weng_Lodato/dog_project/")
-chunk <- function(x,n) split(x, factor(sort(rank(x)%%n)))
-library(pheatmap)
-library(MASS)
-library(lmerTest)
-library(epitools)
+#!/usr/bin/env Rscript
 
+# Dog neuron somatic mutation manuscript analysis
+#
+# This script is a cleaned, documented version of scripts/dog_mutation_project.R.
+# It keeps the original analysis order and output filenames while making the
+# execution environment explicit and portable.
+#
+# Expected layout:
+#   tables/   input tables, intermediate mutation profiles, and RDS objects
+#   figures/  generated manuscript figures
+#   results/  run logs and session information
+#
+# Run from the project root or set DOG_PROJECT_ROOT=/path/to/project before
+# invoking the script. When this file lives in scripts/, the parent directory
+# is used as the project root by default.
+
+options(stringsAsFactors = FALSE)
+set.seed(1)
+
+`%||%` <- function(x, y) {
+  if (length(x) == 0 || is.na(x) || !nzchar(x)) y else x
+}
+
+command_args <- commandArgs(FALSE)
+script_path <- command_args[grep("^--file=", command_args)[1]] %||% "."
+script_path <- normalizePath(sub("^--file=", "", script_path), mustWork = FALSE)
+script_dir <- if (file.exists(script_path)) dirname(script_path) else getwd()
+project_root <- Sys.getenv("DOG_PROJECT_ROOT", unset = NA_character_)
+if (is.na(project_root) || !nzchar(project_root)) {
+  project_root <- if (basename(script_dir) == "scripts") dirname(script_dir) else script_dir
+}
+project_root <- normalizePath(project_root, mustWork = FALSE)
+setwd(project_root)
+
+dir.create("figures", showWarnings = FALSE, recursive = TRUE)
+dir.create("results", showWarnings = FALSE, recursive = TRUE)
+dir.create("tables/For_manuscript", showWarnings = FALSE, recursive = TRUE)
+dir.create("figures/cosmic_signatures", showWarnings = FALSE, recursive = TRUE)
+dir.create("figures/mutation_profile_human_vs_dog", showWarnings = FALSE, recursive = TRUE)
+dir.create("figures/enrichment_analysis", showWarnings = FALSE, recursive = TRUE)
+
+command_log <- file.path("results", "dog_mutation_project_codex.command.txt")
+writeLines(c(
+  paste("working_directory:", getwd()),
+  paste("command:", paste(commandArgs(FALSE), collapse = " ")),
+  paste("started:", format(Sys.time(), usetz = TRUE))
+), command_log)
+on.exit({
+  sink(file.path("results", "dog_mutation_project_codex.sessionInfo.txt"))
+  print(sessionInfo())
+  sink()
+}, add = TRUE)
+
+load_package <- function(pkg) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    stop("Required R package is not installed: ", pkg, call. = FALSE)
+  }
+  suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+}
+
+required_packages <- c("pheatmap", "MASS", "lmerTest", "epitools", "RColorBrewer")
+invisible(lapply(required_packages, load_package))
+
+assert_files_exist <- function(paths) {
+  missing <- paths[!file.exists(paths)]
+  if (length(missing) > 0) {
+    stop(paste(c("Missing required input files:", paste(" -", missing)), collapse = "\n"), call. = FALSE)
+  }
+}
+
+read_tsv <- function(path, header = TRUE, row.names = 1, check.names = FALSE, ...) {
+  assert_files_exist(path)
+  read.table(path, header = header, row.names = row.names, sep = "\t", check.names = check.names, comment.char = "", ...)
+}
+
+chunk <- function(x, n) split(x, factor(sort(rank(x) %% n)))
+
+cs_gg <- c(
+  "#E64B35", "#4DBBD5", "#00A087", "#3C5488", "#F39B7F", "#8491B4",
+  "#91D1C2", "#DC0000", "#7E6148", "#B09C85"
+)
+cs25 <- grDevices::hcl.colors(25, palette = "Dynamic")
+
+add_axis <- function(side, ...) axis(side, ...)
+
+fun_boxplot <- function(x, points = FALSE, col = NULL, ...) {
+  bp <- boxplot(x, col = col, outline = FALSE, xaxt = "n", ...)
+  if (points) {
+    for (i in seq_along(x)) points(jitter(rep(i, length(x[[i]])), amount = 0.08), x[[i]], pch = 20, col = "grey30")
+  }
+  invisible(bp)
+}
+
+fun_addRegressionLine_lmer <- function(model, xvar, xmin, xmax, species = NULL, se = TRUE, ...) {
+  newdata <- data.frame(age = seq(xmin, xmax, length.out = 100))
+  names(newdata)[1] <- xvar
+  fixed_terms <- names(lme4::fixef(model))
+  if ("sexMale" %in% fixed_terms || "sex" %in% all.vars(stats::formula(model))) newdata$sex <- "Male"
+  if ("coverage" %in% all.vars(stats::formula(model))) newdata$coverage <- mean(model@frame$coverage, na.rm = TRUE)
+  if ("mapd" %in% all.vars(stats::formula(model))) newdata$mapd <- mean(model@frame$mapd, na.rm = TRUE)
+  if ("species" %in% all.vars(stats::formula(model))) newdata$species <- species %||% model@frame$species[1]
+  pred <- predict(model, newdata = newdata, re.form = NA, allow.new.levels = TRUE)
+  lines(newdata[[xvar]], pred, ...)
+}
+
+fun_snv_profile <- function(profile, main = "", ylab = "n. sSNV", col = col_sig) {
+  barplot(profile, col = col, border = "white", space = 0, names = names(profile), las = 3, main = main, ylab = ylab)
+  abline(v = (1:5) * 16)
+  text((1:6) * 16 - 8, max(profile, na.rm = TRUE) * 0.95, labels = c("C>A", "C>G", "C>T", "T>A", "T>C", "T>G"))
+}
+
+fun_indel_profile <- function(profile, main = "", ylab = "n. sindel", col = col_sig_indel) {
+  ns <- c(rep(c(1, 2, 3, 4, 5, "6+"), 2), rep(c(0, 1, 2, 3, 4, "5+"), 2),
+          rep(c(1, 2, 3, 4, 5, "6+"), 4), rep(c(0, 1, 2, 3, 4, "5+"), 4), c(1, 1, 2, 1, 2, 3, 1, 2, 3, 4, "5+"))
+  barplot(profile, col = col, border = "white", space = 0, names = ns, las = 3, main = main, ylab = ylab)
+}
+
+fun_deseq <- function(counts, case_index, control_index) {
+  load_package("DESeq2")
+  samples <- data.frame(condition = factor(c(rep("case", length(case_index)), rep("control", length(control_index)))))
+  mat <- round(as.matrix(counts[, c(case_index, control_index)]))
+  dds <- DESeq2::DESeqDataSetFromMatrix(mat, samples, design = ~ condition)
+  dds <- DESeq2::DESeq(dds)
+  as.data.frame(DESeq2::results(dds, contrast = c("condition", "case", "control")))
+}
+
+message("Project root: ", getwd())
+
+# -----------------------------------------------------------------------------
+# Original analysis, with portability fixes and helper functions defined above.
+# -----------------------------------------------------------------------------
 # read data----
 # remember when calculating genome burden and sensitivity,
 # I multiplied the numbers (per Gb) to 5.833, which is the size of human autosomes.
@@ -308,7 +431,7 @@ barplot(t(tdf),col=c("#8da0cb","#e78ac3"),las=3,main="sSNV signature exposure fo
         names=paste(out_mat_all[tmp_cells,"donor"],"; ",out_mat_all[tmp_cells,"age"],"yrs",sep=""),cex.names=0.6)
 legend("topleft",pch=15,col=c("#8da0cb","#e78ac3"),legend=c("ID-A","ID-B"),pt.cex=2,bty="n")
 
-tmp_cells=cells_human[order(out_mat_all[cells_human,"age"])]
+tmp_cells=cells_hs[order(out_mat_all[cells_hs,"age"])]
 tdf=as.matrix(out_mat_all[tmp_cells,c("signature A1","signature A2")]/len_human_autosome)
 barplot(t(tdf),col=c("#66c2a5","#fc8d62"),las=3,main="sSNV signature exposure for human neurons",ylab="mutation/Gb",
         names=paste(out_mat_all[tmp_cells,"donor"],"; ",out_mat_all[tmp_cells,"age"],"yrs",sep=""),cex.names=0.2)
@@ -371,7 +494,7 @@ barplot(t(n_sigs_indel[tmp_cells,order(apply(n_sigs_indel,2,sum),decreasing=T)])
         cex.names=0.6,las=3)
 legend("topleft",legend=active_cosmic_indel[order(apply(n_sigs_indel,2,sum),decreasing=T)],
        col=brewer.pal(length(active_cosmic_indel),"Set3"),pch=15,pt.cex=2,bty="n")
-tmp_cells=cells_human[order(out_mat_all[cells_human,"age"])]
+tmp_cells=cells_hs[order(out_mat_all[cells_hs,"age"])]
 barplot(t(n_sigs_snv[tmp_cells,order(apply(n_sigs_snv,2,sum),decreasing=T)]),
         col=brewer.pal(length(active_cosmic_snv),"Set3"),ylab="mutations/Gb",main="sSNV in human neurons",
         names=paste(out_mat_all[tmp_cells,"donor"],"; ",out_mat_all[tmp_cells,"age"],"yrs",sep=""),
@@ -386,21 +509,8 @@ legend("topleft",legend=active_cosmic_indel[order(apply(n_sigs_indel,2,sum),decr
        col=brewer.pal(length(active_cosmic_indel),"Set3"),pch=15,pt.cex=2,bty="n")
 dev.off()
 
-## Inspect
-cos_sim
-plot_cosine_heatmap(cos_sim)
-
-cosmic_snv=get_known_signatures("snv")
-refit_snv=fit_to_signatures(mut_mat, cosmic_snv)
-
-t=apply(refit_snv$contribution*colSums(cosmic_snv),2,function(x){return(x/sum(x))})
-n_sigs=t(t)
-n_sigs[cells_used,]=n_sigs[cells_used,]*out_mat[cells_used,]$sSNV_burden
-
-cosmic_indel=cosmic_indel=get_known_signatures("indel")
-cosmic_indel=read.table("tables/annotation/COSMIC_v3.4_ID_GRCh37.txt",header=T,row.names=1,check.names=T)
-cosmic_indel=as.matrix(cosmic_indel)
-refit_indel=fit_to_signatures(mut_mat_indel, cosmic_indel)
+# Interactive inspection block from the original script was removed.
+# The COSMIC refitting used for figures is performed in the preceding section.
 contri=refit_indel$contribution*colSums(cosmic_indel)
 tn=cells_Jenn[order(meta_pd[cells_Jenn,"age"])]
 tn=tn[order(meta_pd[tn,"disease"])]
@@ -586,8 +696,8 @@ ns=c(rep(c(1,2,3,4,5,"6+"),2),rep(c(0,1,2,3,4,"5+"),2),
 pdf("figures/indel.profiles.samples.pdf",width=12,height=7.5/2,useDingbats=F)
 par(tcl=0.3,bty="n",cex=5/6)
 for(cn in rns){
-  barplot(indel.sig[,cn],col=tcs,border="white",space=0,las=1,
-          names=ns,las=3,main=cn,ylab="N of identified sindel")
+  barplot(indel.sig[,cn],col=tcs,border="white",space=0,
+          names=ns, las=3,main=cn,ylab="N of identified sindel")
   axis(1,c(6.5,18.5,36.5,60.5,77.5),
        label=c("homopolymer\nlength","homopolymer\nlength","number of\nrepeat units",
                "number of\nrepeat units","microhomology\nlength"),lwd=0,padj=2,cex.axis=0.5)
@@ -601,8 +711,8 @@ dev.off()
 
 pdf("figures/indel.profiles.donors.pdf",width=12,height=7.5/2,useDingbats=F)
 par(tcl=0.3,bty="n",cex=5/6)
-barplot(apply(indel.sig[,rns],1,sum),col=tcs,border="white",space=0,las=1,
-        names=ns,las=3,main="all donors",ylab="N of identified sindel")
+barplot(apply(indel.sig[,rns],1,sum),col=tcs,border="white",space=0,
+          names=ns, las=3,main="all donors",ylab="N of identified sindel")
 axis(1,c(6.5,18.5,36.5,60.5,77.5),
      label=c("homopolymer\nlength","homopolymer\nlength","number of\nrepeat units",
              "number of\nrepeat units","microhomology\nlength"),lwd=0,padj=2,cex.axis=0.5)
@@ -618,8 +728,8 @@ for(s in unique(smps)){
   }else{
     x=indel.sig[,rns[cns]]
   }
-  barplot(x,col=tcs,border="white",space=0,las=1,
-          names=ns,las=3,main=paste(s,"; ",samples[s,1],"; ",samples[s,4],"yrs",sep=""),ylab="N of identified sindel")
+  barplot(x,col=tcs,border="white",space=0,
+          names=ns, las=3,main=paste(s,"; ",samples[s,1],"; ",samples[s,4],"yrs",sep=""),ylab="N of identified sindel")
   axis(1,c(6.5,18.5,36.5,60.5,77.5),
        label=c("homopolymer\nlength","homopolymer\nlength","number of\nrepeat units",
                "number of\nrepeat units","microhomology\nlength"),lwd=0,padj=2,cex.axis=0.5)
@@ -678,8 +788,8 @@ ns=c(rep(c(1,2,3,4,5,"6+"),2),rep(c(0,1,2,3,4,"5+"),2),
 pdf("figures/indel.profiles.samples.human.pdf",width=12,height=7.5/2,useDingbats=F)
 par(tcl=0.3,bty="n",cex=5/6)
 for(cn in rns){
-  barplot(indel.sig_pd[,cn],col=tcs,border="white",space=0,las=1,
-          names=ns,las=3,main=cn,ylab="N of identified sindel")
+  barplot(indel.sig_pd[,cn],col=tcs,border="white",space=0,
+          names=ns, las=3,main=cn,ylab="N of identified sindel")
   axis(1,c(6.5,18.5,36.5,60.5,77.5),
        label=c("homopolymer\nlength","homopolymer\nlength","number of\nrepeat units",
                "number of\nrepeat units","microhomology\nlength"),lwd=0,padj=2,cex.axis=0.5)
@@ -693,8 +803,8 @@ dev.off()
 
 pdf("figures/indel.profiles.donors.human.pdf",width=12,height=7.5/2,useDingbats=F)
 par(tcl=0.3,bty="n",cex=5/6)
-barplot(apply(indel.sig_pd[,rns],1,sum),col=tcs,border="white",space=0,las=1,
-        names=ns,las=3,main="all donors",ylab="N of identified sindel")
+barplot(apply(indel.sig_pd[,rns],1,sum),col=tcs,border="white",space=0,
+          names=ns, las=3,main="all donors",ylab="N of identified sindel")
 axis(1,c(6.5,18.5,36.5,60.5,77.5),
      label=c("homopolymer\nlength","homopolymer\nlength","number of\nrepeat units",
              "number of\nrepeat units","microhomology\nlength"),lwd=0,padj=2,cex.axis=0.5)
@@ -710,8 +820,8 @@ for(s in unique(smps)){
   }else{
     x=indel.sig_pd[,rns[cns]]
   }
-  barplot(x,col=tcs,border="white",space=0,las=1,
-          names=ns,las=3,main=paste(s,"; ",meta_pd[rns[cns[1]],"age"],"yrs",sep=""),ylab="N of identified sindel")
+  barplot(x,col=tcs,border="white",space=0,
+          names=ns, las=3,main=paste(s,"; ",meta_pd[rns[cns[1]],"age"],"yrs",sep=""),ylab="N of identified sindel")
   axis(1,c(6.5,18.5,36.5,60.5,77.5),
        label=c("homopolymer\nlength","homopolymer\nlength","number of\nrepeat units",
                "number of\nrepeat units","microhomology\nlength"),lwd=0,padj=2,cex.axis=0.5)
@@ -829,8 +939,8 @@ tcs=c(rep(rgb(244,192,122,maxColorValue=255),6),rep(rgb(238,133,51,maxColorValue
 ns=c(rep(c(1,2,3,4,5,"6+"),2),rep(c(0,1,2,3,4,"5+"),2),
      rep(c(1,2,3,4,5,"6+"),4),rep(c(0,1,2,3,4,"5+"),4),c(1,1,2,1,2,3,1,2,3,4,"5+"))
 for(i in 1:ncol(nmf_res_indel$signatures)){
-  barplot(nmf_res_indel$signatures[,i],col=tcs,border="white",space=0,las=1,
-          names=ns,las=3,main=colnames(nmf_res_indel$signatures)[i],
+  barplot(nmf_res_indel$signatures[,i],col=tcs,border="white",space=0,
+          names=ns, las=3,main=colnames(nmf_res_indel$signatures)[i],
           ylab="N of identified sINDELs")
   axis(1,c(6.5,18.5,36.5,60.5,77.5),
        label=c("homopolymer\nlength","homopolymer\nlength","number of\nrepeat units",
